@@ -96,15 +96,15 @@ struct MainView: View {
                     let fileName = url.lastPathComponent
 
                     vm.isImportingInProgress = true
-                    let existingIds = Set(vm.unipackItems.map { $0.id })
 
                     Task {
                         let workspace = WorkspaceManager.shared.downloadWorkspace.url
                         let importer = UniPackImporter()
                         let delegate = MainViewImportDelegate(viewModel: vm)
                         // The delegate already shows the error; the thrown value is only reported.
+                        var importedFolder: URL?
                         do {
-                            try await importer.importPack(data: zipData, fileName: fileName, to: workspace, delegate: delegate)
+                            importedFolder = try await importer.importPack(data: zipData, fileName: fileName, to: workspace, delegate: delegate)
                             UsageAnalytics.shared.packImportSucceeded(source: .file)
                         } catch {
                             UsageAnalytics.shared.packImportFailed(source: .file, error: error)
@@ -114,7 +114,9 @@ struct MainView: View {
                             vm.isImportingInProgress = false
                             vm.refreshList()
                             vm.updateStats()
-                            vm.showImportResultForNew(existingIds: existingIds)
+                            if let importedFolder {
+                                vm.showImportResult(forImportedFolder: importedFolder)
+                            }
                             showImportResult = true
                         }
                     }
@@ -151,44 +153,14 @@ struct MainView: View {
                 ZStack {
                     Color.black.opacity(0.5).ignoresSafeArea()
                         .onTapGesture {
-                            showImportResult = false
-                            vm.importResult = nil
+                            dismissImportResult()
                         }
 
-                    VStack(spacing: 0) {
-                        // Title bar
-                        Text({
-                            switch result {
-                            case .success: String(localized: "importComplete")
-                            case .warning: String(localized: "warning")
-                            case .error: String(localized: "importFailed")
-                            }
-                        }())
-                        .font(.system(size: 16, weight: .bold))
-                        .foregroundStyle(AppColors.textPrimary)
-                        .padding(.top, 16)
-                        .padding(.bottom, 8)
-
-                        ImportResultDialog(result: result, onDismiss: {})
-
-                        // OK button
-                        Divider()
-                            .background(AppColors.divider)
-                        Button {
-                            showImportResult = false
-                            vm.importResult = nil
-                        } label: {
-                            Text(String(localized: "accept"))
-                                .font(.system(size: 14, weight: .medium))
-                                .foregroundStyle(AppColors.blue)
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 12)
-                        }
-                    }
-                    .background(AppColors.darkSurface)
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
-                    .padding(.horizontal, 40)
-                    .frame(maxWidth: 360)
+                    ImportResultDialog(
+                        result: result,
+                        onDismiss: dismissImportResult,
+                        onPlayNow: playImportedPack
+                    )
                 }
             }
         }
@@ -210,6 +182,17 @@ struct MainView: View {
                 }
             }
         }
+    }
+
+    private func dismissImportResult() {
+        showImportResult = false
+        vm.importResult = nil
+    }
+
+    private func playImportedPack(_ unipack: UniPack) {
+        dismissImportResult()
+        vm.recordOpen(unipack)
+        router.navigate(to: .play(packPath: unipack.getPathString()))
     }
 
     // MARK: - Left Panel
