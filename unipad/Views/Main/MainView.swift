@@ -23,6 +23,7 @@ struct MainView: View {
         }
         .background(AppColors.background1)
         .platformNavigationBarHidden(true)
+        .defersSystemGestures(on: .all)
         .onKeyPress(.escape) {
             if vm.selectedItem != nil {
                 vm.toggleSelection(vm.selectedItem!)

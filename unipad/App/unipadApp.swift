@@ -114,6 +114,7 @@ struct unipadApp: App {
             .environment(router)
             .environment(modelStoreStatus)
             .preferredColorScheme(.dark)
+            .defersSystemGestures(on: .all)
             .overlay(alignment: .top) {
                 if midiBanner.isVisible {
                     MidiConnectionBannerView(
