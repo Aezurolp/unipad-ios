@@ -44,6 +44,10 @@ final class SoundEngine {
     var isPlaybackSuppressed: Bool { gate.isPlaybackSuppressed }
     /// How many pads have reached `play()`. A test seam, and the counter a suppressed pad leaves alone.
     private(set) var playsStarted = 0
+    /// Test observations for finite-loop completion and stale callback cancellation.
+    private let repeatScheduler = FiniteRepeatScheduler()
+    var repeatedBuffersScheduled: Int { repeatScheduler.buffersScheduled }
+    var activeVoiceCount: Int { nodePlayID.filter { $0 != 0 }.count }
 
     protocol LoadingListener: AnyObject {
         func onStart(soundCount: Int)
@@ -306,7 +310,7 @@ final class SoundEngine {
             index = victim ?? 0
         }
         let node = playerNodes[index]
-        node.stop()
+        repeatScheduler.stop(node)
         nodePlayID[index] = 0
         return (node, index)
     }
@@ -314,7 +318,7 @@ final class SoundEngine {
     private func stopByPlayID(_ playID: Int) {
         guard playID > 0 else { return }
         if let idx = nodePlayID.firstIndex(of: playID) {
-            playerNodes[idx].stop()
+            repeatScheduler.stop(playerNodes[idx])
             nodePlayID[idx] = 0
         }
     }
@@ -366,7 +370,7 @@ final class SoundEngine {
     private func releaseAllVoices() {
         let nodes = playerNodes
         _ = runCatchingObjCException {
-            for node in nodes { node.stop() }
+            for node in nodes { repeatScheduler.stop(node) }
         }
         for i in nodePlayID.indices {
             nodePlayID[i] = 0
@@ -416,6 +420,7 @@ final class SoundEngine {
         // raises ("player did not see an IO cycle") rather than throwing, and Swift cannot catch it,
         // so scheduling and play() run inside the Objective-C catcher: what is left of the race costs
         // one silent pad instead of the process.
+        var repeatFailure: String?
         let failure = runCatchingObjCException {
             if node.engine == nil {
                 engine.attach(node)
@@ -426,25 +431,21 @@ final class SoundEngine {
             if sound.loop == -1 {
                 node.scheduleBuffer(buffer, at: nil, options: .loops)
             } else if sound.loop > 0 {
-                func scheduleRemaining(_ remaining: Int) {
-                    guard remaining > 0 else { release(); return }
-                    node.scheduleBuffer(buffer, at: nil, options: []) { [weak node] in
-                        guard let node, node.isPlaying else { return }
-                        scheduleRemaining(remaining - 1)
+                repeatFailure = repeatScheduler.start(buffer, node: node, totalPlays: sound.loop + 1) { [weak self] failure in
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self, self.nodePlayID.indices.contains(nodeIndex), self.nodePlayID[nodeIndex] == playID else { return }
+                        self.nodePlayID[nodeIndex] = 0
+                        if let failure { self.gate.playbackFailed(reason: failure) }
                     }
-                }
-                node.scheduleBuffer(buffer, at: nil, options: []) { [weak node] in
-                    guard let node, node.isPlaying else { return }
-                    scheduleRemaining(sound.loop)
                 }
             } else {
                 node.scheduleBuffer(buffer, at: nil, options: []) { release() }
             }
-            node.play()
+            if sound.loop <= 0 { node.play() }
         }
-        if let failure {
+        if let failure = failure ?? repeatFailure {
             logger.error("play() raised: \(failure, privacy: .public)")
-            _ = runCatchingObjCException { node.stop() }
+            repeatScheduler.stop(node)
             nodePlayID[nodeIndex] = 0
             stopID[c][x][y] = 0
             gate.playbackFailed(reason: failure)
@@ -476,13 +477,14 @@ final class SoundEngine {
     func destroy() {
         // Terminal: a notification that lands after this must not restart the engine we just stopped.
         gate.shutDown()
+        for i in nodePlayID.indices { nodePlayID[i] = 0 }
         for token in observerTokens {
             NotificationCenter.default.removeObserver(token)
         }
         observerTokens.removeAll()
+        for node in playerNodes { repeatScheduler.stop(node) }
         engine.stop()
         for node in playerNodes {
-            node.stop()
             engine.detach(node)
         }
         playerNodes.removeAll()
@@ -496,5 +498,78 @@ final class SoundEngine {
         case bufferCreationFailed
         case converterCreationFailed
         case conversionFailed
+    }
+}
+
+/// AVFoundation completion handlers only enqueue work and return. The serial queue owns finite
+/// repeat scheduling and stopping, so stop() cannot wait for a callback that waits for our queue.
+/// A bounded lookahead shares the decoded buffer; even an enormous loop count cannot flood memory
+/// or hold the screen while all repeats are scheduled. Supply does not depend on the main actor.
+nonisolated final class FiniteRepeatScheduler {
+    private let queue = DispatchQueue(label: "UniPad.finiteRepeats", qos: .userInteractive)
+    private var voices: [ObjectIdentifier: Voice] = [:]
+    private var scheduled = 0
+    var buffersScheduled: Int { queue.sync { scheduled } }
+
+    private final class Voice {
+        let node: AVAudioPlayerNode
+        let buffer: AVAudioPCMBuffer
+        var remaining: Int
+        let completion: (String?) -> Void
+
+        init(node: AVAudioPlayerNode, buffer: AVAudioPCMBuffer, totalPlays: Int, completion: @escaping (String?) -> Void) {
+            self.node = node
+            self.buffer = buffer
+            remaining = totalPlays
+            self.completion = completion
+        }
+    }
+
+    func start(_ buffer: AVAudioPCMBuffer, node: AVAudioPlayerNode, totalPlays: Int, completion: @escaping (String?) -> Void) -> String? {
+        queue.sync {
+            let voice = Voice(node: node, buffer: buffer, totalPlays: totalPlays, completion: completion)
+            let key = ObjectIdentifier(node)
+            voices[key] = voice
+            let seconds = Double(max(1, buffer.frameLength)) / buffer.format.sampleRate
+            let lookahead = min(128, max(2, Int(ceil(0.1 / seconds))))
+            let failure = runCatchingObjCException {
+                for _ in 0..<min(totalPlays, lookahead) { schedule(voice) }
+                node.play()
+            }
+            if failure != nil { voices.removeValue(forKey: key) }
+            return failure
+        }
+    }
+
+    func stop(_ node: AVAudioPlayerNode) {
+        queue.sync {
+            // Invalidate before stop triggers completion handlers. Already enqueued handlers also
+            // check identity, so they cannot schedule or release a replacement voice on this node.
+            voices.removeValue(forKey: ObjectIdentifier(node))
+            _ = runCatchingObjCException { node.stop() }
+        }
+    }
+
+    private func schedule(_ voice: Voice) {
+        voice.remaining -= 1
+        let final = voice.remaining == 0
+        scheduled += 1
+        voice.node.scheduleBuffer(voice.buffer, at: nil, options: [], completionCallbackType: final ? .dataPlayedBack : .dataConsumed) { [weak self, weak voice] _ in
+            self?.queue.async { [weak self, weak voice] in
+                guard let self, let voice else { return }
+                let key = ObjectIdentifier(voice.node)
+                guard self.voices[key] === voice else { return }
+                if final {
+                    self.voices.removeValue(forKey: key)
+                    voice.completion(nil)
+                } else if voice.remaining > 0 {
+                    if let failure = runCatchingObjCException({ self.schedule(voice) }) {
+                        self.voices.removeValue(forKey: key)
+                        _ = runCatchingObjCException { voice.node.stop() }
+                        voice.completion(failure)
+                    }
+                }
+            }
+        }
     }
 }
