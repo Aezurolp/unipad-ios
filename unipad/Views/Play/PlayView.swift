@@ -24,7 +24,6 @@ struct PlayView: View {
         #if canImport(UIKit)
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
-        .defersSystemGestures(on: .all)
         #endif
         .alert(String(localized: "warning"), isPresented: Binding(
             get: { vm.unipackWarning != nil },
